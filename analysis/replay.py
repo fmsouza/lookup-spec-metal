@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import pathlib
+import statistics
 import sys
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
@@ -36,6 +37,11 @@ class AcceptanceStats:
     hit_accepted: int = 0      # Σ accepted on rounds where it proposed
     drafted: int = 0           # Σ draft tokens proposed (for waste accounting)
     tokens: int = 0            # Σ tokens emitted (= rounds + accepted)
+    draft_lens: list = None    # per-round proposed length, for verification cost
+
+    def __post_init__(self):
+        if self.draft_lens is None:
+            self.draft_lens = []
 
     @property
     def tokens_per_pass(self) -> float:
@@ -63,6 +69,49 @@ class AcceptanceStats:
                 "draft_waste": self.draft_waste}
 
 
+def load_verify_cost(path="results/raw/verify-cost.json", ctx_hint=4096):
+    """Measured cost of a k-token verification pass, in units of a 1-token decode.
+
+    Without this file, tokens-per-pass would be reported as if verification were free,
+    which it is not. Returns None when unavailable so callers can say so explicitly
+    rather than silently assuming 1.0.
+    """
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    rows = json.loads(p.read_text())["rows"]
+    ctxs = sorted({r["ctx"] for r in rows})
+    ctx = min(ctxs, key=lambda c: abs(c - ctx_hint))
+    tbl = {r["k"]: r["cost_vs_k1"] for r in rows if r["ctx"] == ctx}
+
+    def cost(k):
+        k = max(1, int(k))
+        if k in tbl:
+            return tbl[k]
+        ks = sorted(tbl)
+        if k > ks[-1]:                       # linear extrapolation past the grid
+            (k0, k1) = ks[-2], ks[-1]
+            slope = (tbl[k1] - tbl[k0]) / (k1 - k0)
+            return tbl[k1] + slope * (k - k1)
+        lo = max(x for x in ks if x <= k)
+        hi = min(x for x in ks if x >= k)
+        if lo == hi:
+            return tbl[lo]
+        f = (k - lo) / (hi - lo)
+        return tbl[lo] * (1 - f) + tbl[hi] * f
+
+    cost.ctx = ctx                                                    # type: ignore
+    return cost
+
+
+def speedup(st, cost) -> Optional[float]:
+    """Wall-clock speedup over dense greedy, charging each round its real verify cost."""
+    if cost is None or not st.rounds:
+        return None
+    total_cost = sum(cost(d + 1) for d in st.draft_lens)
+    return st.tokens / total_cost
+
+
 def replay(context: Sequence[int], stream: Sequence[int], propose: Callable,
            per_round: Optional[list] = None) -> AcceptanceStats:
     """Replay `propose` against a frozen `stream` that follows `context`."""
@@ -80,6 +129,7 @@ def replay(context: Sequence[int], stream: Sequence[int], propose: Callable,
         st.rounds += 1
         st.accepted += acc
         st.drafted += len(draft)
+        st.draft_lens.append(len(draft))
         if draft:
             st.hits += 1
             st.hit_accepted += acc
@@ -119,6 +169,7 @@ def replay_composite(context, stream, primary, secondary,
         st.rounds += 1
         st.accepted += acc
         st.drafted += len(draft)
+        st.draft_lens.append(len(draft))
         st.by_source[src] += 1                                        # type: ignore
         if src != "none":
             st.hits += 1
@@ -195,10 +246,132 @@ def _check():
     return 0 if ok else 1
 
 
+# --------------------------------------------------------------------------
+def load_generations(path="generated"):
+    out = []
+    for p in sorted(pathlib.Path(path).glob("*.json")):
+        d = json.loads(p.read_text())
+        if d.get("generated_ids"):
+            out.append(d)
+    return out
+
+
+def ctx_bucket(n):
+    for lo in (16384, 8192, 4096, 0):
+        if n >= lo:
+            return {16384: "16K+", 8192: "8K-16K", 4096: "4K-8K", 0: "<4K"}[lo]
+
+
+def drafter_grid():
+    """The configurations A0 sweeps. Kept small and explicit rather than generated."""
+    grid = []
+    for n in (1, 2, 3, 4):
+        for k in (4, 8, 16, 32):
+            grid.append(LookupDrafter(n=n, kmax=k, policy="most_recent"))
+    for k in (8, 16, 32):
+        grid.append(LookupDrafter(n=2, kmax=k, policy="longest"))
+        grid.append(MultiLookupDrafter(ns=(4, 3, 2), kmax=k))
+        grid.append(MultiLookupDrafter(ns=(8, 5, 3), kmax=k))
+    return grid
+
+
+def sweep(args):
+    gens = load_generations(args.generated)
+    if not gens:
+        sys.exit(f"no frozen generations in {args.generated!r} -- run analysis/generate.py")
+    cost = load_verify_cost(args.verify_cost)
+    if cost is None:
+        print(f"! {args.verify_cost} missing -- reporting tokens/pass only.\n"
+              f"! Run bench/verify_cost.py; tokens/pass is NOT a speedup.\n")
+
+    rows = []
+    for d in drafter_grid():
+        per_kind = {}
+        for kind in ("agentic", "control"):
+            gs = [g for g in gens if g["kind"] == kind]
+            if not gs:
+                continue
+            tot = AcceptanceStats()
+            per_trace, per_trace_sp, per_bucket = [], [], {}
+            for g in gs:
+                st = replay(g["context_ids"], g["generated_ids"], d.propose)
+                for f in ("rounds", "accepted", "hits", "hit_accepted",
+                          "drafted", "tokens"):
+                    setattr(tot, f, getattr(tot, f) + getattr(st, f))
+                tot.draft_lens.extend(st.draft_lens)
+                per_trace.append(st.tokens_per_pass)
+                sp = speedup(st, cost)
+                if sp is not None:
+                    per_trace_sp.append(sp)
+                b = ctx_bucket(len(g["context_ids"]))
+                per_bucket.setdefault(b, []).append(st.tokens_per_pass)
+            r = tot.as_dict()
+            r.pop("draft_lens", None)
+            r["n_traces"] = len(gs)
+            # the pooled mean is throughput-correct but heavy-tailed: a single long
+            # copy-heavy turn can carry it. The per-trace median is what a typical
+            # turn sees, so both are reported and the gate reads the median.
+            r["median_tokens_per_pass"] = statistics.median(per_trace)
+            r["sd_tokens_per_pass"] = (statistics.stdev(per_trace)
+                                       if len(per_trace) > 1 else 0.0)
+            r["pooled_speedup"] = speedup(tot, cost)
+            r["median_speedup"] = (statistics.median(per_trace_sp)
+                                   if per_trace_sp else None)
+            r["by_ctx"] = {b: sum(v) / len(v) for b, v in sorted(per_bucket.items())}
+            per_kind[kind] = r
+        rows.append({"drafter": d.name, "by_kind": per_kind})
+
+    key = (lambda r: r["by_kind"]["agentic"].get("median_speedup") or 0) if cost else \
+          (lambda r: r["by_kind"]["agentic"]["median_tokens_per_pass"])
+    best = max(rows, key=key)
+
+    out = {
+        "kind": "a0-sweep",
+        "model": gens[0]["model"],
+        "env": gens[0].get("env", {}),
+        "verify_cost_file": args.verify_cost if cost else None,
+        "verify_cost_ctx": getattr(cost, "ctx", None),
+        "generations": [{"id": g["id"], "kind": g["kind"],
+                         "ctx": len(g["context_ids"]),
+                         "gen": len(g["generated_ids"]), "langs": g["langs"]}
+                        for g in gens],
+        "rows": rows,
+        "best_agentic": best["drafter"],
+    }
+    pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(args.out).write_text(json.dumps(out, indent=1))
+
+    w = max(len(r["drafter"]) for r in rows)
+    print(f"{'drafter'.ljust(w)}  {'med spd':>8} {'pool spd':>9} {'med t/p':>8} "
+          f"{'pool t/p':>9} {'hit':>7} {'waste':>7} {'ctl spd':>8}")
+    for r in sorted(rows, key=key, reverse=True):
+        a = r["by_kind"]["agentic"]
+        c = r["by_kind"].get("control", {})
+        f = lambda v: f"{v:8.3f}" if isinstance(v, float) else f"{'--':>8}"
+        print(f"{r['drafter'].ljust(w)}  {f(a['median_speedup'])} "
+              f"{f(a['pooled_speedup'])[:9]:>9} {a['median_tokens_per_pass']:>8.3f} "
+              f"{a['tokens_per_pass']:>9.3f} {100*a['hit_rate']:>6.1f}% "
+              f"{100*a['draft_waste']:>6.1f}% {f(c.get('median_speedup'))}")
+    ba = best["by_kind"]["agentic"]
+    print(f"\nbest agentic: {best['drafter']}")
+    print(f"  median speedup {ba['median_speedup']}, pooled {ba['pooled_speedup']}")
+    print(f"  tokens/pass median {ba['median_tokens_per_pass']:.3f}, "
+          f"pooled {ba['tokens_per_pass']:.3f} (sd {ba['sd_tokens_per_pass']:.3f})")
+    print("  by context:", {k: round(v, 3) for k, v in ba["by_ctx"].items()})
+    print(f"wrote {args.out}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--generated", default="generated")
+    ap.add_argument("--out", default="analysis/summary/a0-sweep.json")
+    ap.add_argument("--verify-cost", default="results/raw/verify-cost.json")
     a = ap.parse_args()
     if a.check:
         sys.exit(_check())
-    ap.error("nothing to do yet; --sweep lands with A0.7")
+    if a.sweep:
+        sweep(a)
+    else:
+        ap.error("pass --check or --sweep")
