@@ -2,6 +2,11 @@
 
 ## Gate
 
+**A0 FAILS its gate on every path.** Best is **1.49×** (cheap verification) or
+**~1.2×** (exact verification), against a **≥2.0× gate**. See "Finding 5" for the
+divergence experiment that decides which of those is available, and
+"Decision" for what is actually on the table.
+
 **A0 FAILS its gate, and sits at the kill line.** Best measured configuration is
 **1.49× median speedup** (`gated(n=2,k=64,agree>=4)`) against a **≥2.0× gate** and a
 **<1.5× kill** criterion — and that figure uses the *cheap, non-exact* verification
@@ -93,6 +98,72 @@ exact verification or cheap parallel verification, not both.**
 Since the best drafters want k=32–64, and the exact path costs 15–25× there, the
 lossless configuration is confined to k≤8 — where speedup is roughly 1.2×.
 
+## Finding 5 — the cheap path changes only decisions the model never made
+
+A0's first pass concluded that losslessness forces the expensive verifier. That
+depended on an untested assumption: that the plain multi-token path meaningfully
+changes outputs. It was tested directly.
+
+The frozen generations are, by construction, the sequential greedy argmaxes. Feeding
+the same streams back through the model in chunks of k and comparing the argmax at
+every position gives, over **10,187 positions × 5 chunk sizes**:
+
+| k | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| positions diverging | 0.442% | 0.442% | 0.432% | 0.442% | 0.402% |
+
+**The rate is flat in k.** That is the whole story. If chunked arithmetic were
+perturbing results, divergence would grow with chunk size — more positions batched,
+more accumulated cache drift. It does not move at all between k=2 and k=32.
+
+Because the cause is not chunking. It is **ties**. Measuring the top1−top2 logit
+margin at each diverging position, over four traces (1,574 positions, 19 divergences):
+
+| | value |
+|---|---|
+| margins at **diverging** positions | 0.0 (×9), 0.125 (×9), 0.25 (×1) — **all ≤ 0.25** |
+| median margin over all positions | **6.125** |
+| exact ties (margin = 0) overall | 2.22% of positions |
+
+Not one divergence occurred at a position decided by more than a quarter of a logit,
+against a typical margin ~50× larger. Every divergence is a coin-flip the model itself
+had no opinion about: at 4-bit weights with bf16 logits over a 248,320-token vocabulary,
+**2.2% of greedy decisions are exact ties**, and roughly a quarter of those resolve
+differently under a different summation order.
+
+The consequence cuts both ways.
+
+**Against the cheap path:** 0.44% per position compounds. A 500-token generation is
+token-identical with probability `0.9956^500 ≈ 11%` — so ~89% of generations would
+differ somewhere. Token identity, the correctness gate `docs/02` specified, is **not
+available** on the plain path.
+
+**Against the premise of that gate:** "lossless greedy decoding" was never a property
+of this model. At 2.2% of positions the greedy argmax is a tie, and which token wins is
+decided by floating-point summation order, not by the model. The exact verifier
+preserves *one particular* arbitrary tie-break — it does not recover a uniquely correct
+answer, because there isn't one. The guarantee is thinner than it sounds.
+
+So the honest claim available on the cheap path is not "identical output" but:
+**no decision with a margin above 0.25 logits is ever changed; divergences occur only
+at top-2 ties, affecting 0.4% of positions.** That is a defensible engineering claim.
+It is not the claim `docs/02` was written around.
+
+## Decision
+
+| path | speedup | correctness claim |
+|---|---|---|
+| exact verifier, k≤8 | **~1.2×** | token-identical to one arbitrary tie-break order |
+| plain multi-token, k=32–64 | **1.49×** offline, ~1.3–1.45× expected end-to-end | no confident decision altered; 0.4% of positions differ, all at ties |
+
+Both fail the ≥2.0× gate. The realistic ceiling for this direction is **~1.3–1.5×**,
+not the 2–3× the plan was built on, and the gap is architectural: Gated DeltaNet makes
+multi-token verification expensive, which is the one cost speculative decoding assumes
+away.
+
+Whether ~1.4× justifies Phase A1's 12–20 h is a scoping call, not a gate outcome. The
+gate outcome is: **A0 fails.**
+
 ## What this means
 
 The thesis was right about the workload and wrong about the machine. Agentic edit turns
@@ -113,11 +184,13 @@ the kill line.
   bounded by Finding 2 regardless.
 - **k≤4 tuning on the exact path.** If the project continues under a lossless
   constraint, this is the only region worth exploring, and the ceiling there is ~1.2×.
-- **Relaxing exactness.** The plain multi-token path is what mainstream speculative
-  decoding implementations use; its outputs are numerically — not semantically —
-  different from sequential decoding. Quantifying how often the argmax actually differs
-  would decide whether 1.49× is available under a weaker but still defensible
-  correctness claim. This is the highest-value next experiment if the project continues.
+- ~~Relaxing exactness~~ — **done, see Finding 5.**
+- **End-to-end validation.** Every number here is offline. A1 would also pay DeltaNet
+  state snapshot/rollback for rejected drafts (48 layers × ~3.1 MB ≈ 151 MB per
+  speculative step, ~1% of a step at measured bandwidth) and n-gram search cost, so the
+  1.49× offline ceiling should be read as ~1.3–1.45× in practice.
+- **MTP as a second source** (A0.6). Sidecar downloaded, not wired. Bounded by
+  Finding 2 regardless of how well it drafts.
 
 ## Reproducing
 
