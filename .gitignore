@@ -1,0 +1,23 @@
+# model artifacts — never commit weights
+*.gguf
+*.safetensors
+*.bin
+*.npz
+models/
+
+# experiment artifacts — traces contain private source code
+analysis/traces/
+results/raw/
+generated/
+*.parquet
+*.arrow
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
