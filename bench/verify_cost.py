@@ -39,33 +39,46 @@ def main(args):
     ks = [int(x) for x in args.ks.split(",")]
     rows = []
 
-    for ctx in [int(c) for c in args.contexts.split(",")]:
+    def prefill(ctx):
+        """Fresh cache at `ctx` tokens.
+
+        The DeltaNet layers keep a recurrent state in an ArraysCache that is mutated
+        in place and cannot be rolled back the way a KV offset can, so a speculative
+        step cannot be un-done -- every measurement gets its own prefill.
+        """
         cache = model.make_cache()
         pre = (filler * (ctx // len(filler) + 2))[:ctx]
-        for s in range(0, len(pre), 2048):
-            trunk(mx.array([pre[s:s + 2048]]), cache=cache)
+        for s_ in range(0, len(pre), 2048):
+            trunk(mx.array([pre[s_:s_ + 2048]]), cache=cache)
             mx.eval([c.state for c in cache])
+        return cache
+
+    for ctx in [int(c) for c in args.contexts.split(",")]:
         base = None
         for k in ks:
-            # a fresh cache branch per k would be ideal; instead measure without
-            # committing, by restoring cache offsets after each timed call
-            offs = [c.offset for c in cache]
+            # One prefill per k, then single-token warmup steps to reach steady
+            # state: the first step after a prefill is much slower (cold kernels,
+            # graph build) and timing it would report ~190ms for k=1, three times
+            # the steady-state cost. The cache then drifts by k per rep, which is
+            # why reps is small and the smallest context measured is 2048.
+            cache = prefill(ctx)
+            for _ in range(args.warmup):
+                trunk(mx.array([[filler[0]]]), cache=cache)
+                mx.eval([c.state for c in cache])
             samples = []
-            for r in range(args.reps + args.warmup):
+            for r in range(args.reps):
                 toks = mx.array([filler[:k]])
                 t0 = time.time()
                 h = trunk(toks, cache=cache)
                 mx.eval(lm_head(h[:, -1:, :]))
                 dt = time.time() - t0
-                for c, o in zip(cache, offs):
-                    c.offset = o                      # roll back the speculative step
-                if r >= args.warmup:
-                    samples.append(dt)
+                samples.append(dt)
             med = statistics.median(samples)
             if k == 1:
                 base = med
             rows.append({"ctx": ctx, "k": k, "ms": 1000 * med,
-                         "cost_vs_k1": med / base})
+                         "cost_vs_k1": med / base,
+                         "drift_tokens": args.reps * k})
             print(f"  ctx {ctx:6d}  k {k:3d}  {1000*med:7.2f} ms  "
                   f"cost {med/base:5.3f}x", flush=True)
 
@@ -80,9 +93,9 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="mlx-community/Qwen3.8-27B-4bit")
-    ap.add_argument("--contexts", default="256,4096,16384")
+    ap.add_argument("--contexts", default="2048,8192,16384")
     ap.add_argument("--ks", default="1,2,4,8,16,32")
-    ap.add_argument("--reps", type=int, default=9)
-    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--warmup", type=int, default=6)
     ap.add_argument("--out", default="results/raw/verify-cost.json")
     main(ap.parse_args())

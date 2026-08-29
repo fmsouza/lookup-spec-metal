@@ -114,6 +114,46 @@ class MultiLookupDrafter:
         return f"multilookup(ns={list(self.ns)},k={self.kmax},{self.policy})"
 
 
+class GatedLookupDrafter:
+    """Draft only when the match is trustworthy.
+
+    Charging real verification cost inverts the naive ranking: on this model a
+    k-token verify costs ~1.2x (k=2) to ~4.5x (k=32) a single-token decode, so a
+    drafter that fires constantly and is usually wrong is *slower than not drafting
+    at all*. What pays is precision, not recall.
+
+    This gates on how far back the context agrees with the current suffix: an n-gram
+    hit backed by `min_agree` further matching tokens is a much stronger signal that
+    the model is mid-copy. Below the gate, propose nothing and let the round run at
+    k=1 cost.
+    """
+
+    def __init__(self, n: int = 2, kmax: int = 32, min_agree: int = 8,
+                 policy: str = "longest"):
+        self.base = LookupDrafter(n=n, kmax=kmax, policy=policy)
+        self.n, self.kmax, self.min_agree, self.policy = n, kmax, min_agree, policy
+
+    def propose(self, context, generated=()) -> List[int]:
+        seq = list(context) + list(generated)
+        hits = self.base._match_positions(seq)
+        if not hits:
+            return []
+        best, best_agree = None, -1
+        for e in hits:
+            a = self.base._agree_len(seq, e)
+            if a > best_agree:
+                best, best_agree = e, a
+            if best_agree >= self.min_agree and self.policy == "most_recent":
+                break
+        if best_agree < self.min_agree:
+            return []
+        return list(seq[best:best + self.kmax])
+
+    @property
+    def name(self) -> str:
+        return f"gated(n={self.n},k={self.kmax},agree>={self.min_agree})"
+
+
 def self_test() -> None:
     """Boundary cases the sweep would otherwise silently mis-measure."""
     d = LookupDrafter(n=2, kmax=3)
@@ -145,6 +185,16 @@ def self_test() -> None:
     assert m.propose([1, 2, 9, 9, 9, 9, 1, 2]) == [9, 9]
     # min_ctx suppresses drafting
     assert LookupDrafter(n=2, kmax=3, min_ctx=100).propose([1, 2, 3, 1, 2]) == []
+    # gated: a bare n-gram hit with no agreeing history is refused
+    g = GatedLookupDrafter(n=2, kmax=4, min_agree=3)
+    assert g.propose([9, 9, 1, 2, 7, 7, 7, 7, 0, 1, 2]) == []
+    # ... but a long agreeing run passes the gate
+    seq = [5, 6, 7, 1, 2, 8, 8, 8, 8, 0, 5, 6, 7, 1, 2]
+    assert GatedLookupDrafter(n=2, kmax=3, min_agree=3).propose(seq) == [8, 8, 8]
+    # min_agree=0 degenerates to the ungated longest policy
+    a = GatedLookupDrafter(n=2, kmax=3, min_agree=0).propose(seq)
+    b = LookupDrafter(n=2, kmax=3, policy="longest").propose(seq)
+    assert a == b, (a, b)
     print("lookup self-test OK")
 
 

@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from src.lookup import LookupDrafter, MultiLookupDrafter  # noqa: E402
+from src.lookup import (GatedLookupDrafter, LookupDrafter,  # noqa: E402
+                        MultiLookupDrafter)
 
 
 @dataclass
@@ -272,6 +273,11 @@ def drafter_grid():
         grid.append(LookupDrafter(n=2, kmax=k, policy="longest"))
         grid.append(MultiLookupDrafter(ns=(4, 3, 2), kmax=k))
         grid.append(MultiLookupDrafter(ns=(8, 5, 3), kmax=k))
+    # precision-first: verification is expensive enough that drafting only on a
+    # strongly corroborated match beats drafting on every n-gram hit
+    for k in (16, 32, 64):
+        for agree in (4, 8, 16, 32):
+            grid.append(GatedLookupDrafter(n=2, kmax=k, min_agree=agree))
     return grid
 
 
