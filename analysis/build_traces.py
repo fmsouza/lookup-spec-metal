@@ -26,6 +26,8 @@ import random
 import re
 import sys
 
+TOOL_RESULT_CHARS = 200_000   # truncation understated lookup by 28%
+
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Update"}
 READ_TOOLS = {"Read", "Bash", "Grep", "Glob", "BashOutput"}
 
@@ -63,10 +65,10 @@ def render_tool_use(name, inp):
     if name == "Bash":
         return f"[Bash]\n$ {inp.get('command', '')}\n"
     if name in ("Grep", "Glob"):
-        return f"[{name}] {json.dumps(inp, ensure_ascii=False)[:400]}\n"
+        return f"[{name}] {json.dumps(inp, ensure_ascii=False)[:4000]}\n"
     if name == "Read":
         return f"[Read {fp}]\n"
-    return f"[{name}] {json.dumps(inp, ensure_ascii=False)[:600]}\n"
+    return f"[{name}] {json.dumps(inp, ensure_ascii=False)[:6000]}\n"
 
 
 def blocks_text(content):
@@ -92,7 +94,7 @@ def blocks_text(content):
             c = b.get("content")
             if isinstance(c, list):
                 c = "\n".join(x.get("text", "") for x in c if isinstance(x, dict))
-            out.append(f"[tool result]\n{str(c)[:4000]}\n")
+            out.append(f"[tool result]\n{str(c)[:TOOL_RESULT_CHARS]}\n")
     return "\n".join(x for x in out if x), tools
 
 
@@ -212,25 +214,39 @@ def build(args):
     manifest = []
 
     def emit(cs, kind, tag):
-      for idx, c in enumerate(cs):
+      idx = -1
+      for c in cs:
           msgs = []
           for role, text in c["history"]:
               if msgs and msgs[-1]["role"] == role:
                   msgs[-1]["content"] += "\n\n" + text
               else:
                   msgs.append({"role": role, "content": text})
-          if not msgs or msgs[-1]["role"] != "user":
-              msgs.append({"role": "user", "content": "Continue."})
-          # trim prefix from the front until it fits
-          while len(msgs) > 1:
-              prefix = tok.apply_chat_template(
-                  msgs, tokenize=False, add_generation_prompt=True)
-              if ntok(prefix) <= args.max_prefix:
-                  break
-              msgs.pop(0)
-          prefix = tok.apply_chat_template(
-              msgs, tokenize=False, add_generation_prompt=True)
 
+          # The selected turn usually continues an assistant turn already in progress
+          # (Claude Code emits prose, then tool calls, as separate messages). Injecting
+          # a synthetic "Continue." user turn there produces a prompt no real decoder
+          # ever sees -- and it did, for 11 of 24 traces on the first build. Instead,
+          # carry trailing assistant content across the generation prompt as an
+          # in-progress turn, which is exactly the state a decoder is in mid-turn.
+          partial = ""
+          while msgs and msgs[-1]["role"] == "assistant":
+              partial = msgs.pop()["content"] + ("\n\n" + partial if partial else "")
+          if not msgs or msgs[-1]["role"] != "user":
+              continue                    # unusable: nothing to condition on
+
+          def render(ms, _p=partial):
+              kw = {} if args.thinking else {"enable_thinking": False}
+              return tok.apply_chat_template(
+                  ms, tokenize=False, add_generation_prompt=True, **kw) + _p
+
+          while len(msgs) > 1 and ntok(render(msgs)) > args.max_prefix:
+              msgs.pop(0)
+          prefix = render(msgs)
+          if ntok(prefix) > args.max_prefix:
+              continue                    # single turn still too large
+
+          idx += 1
           rec = {
               "id": f"{tag}-{idx:02d}",
               "kind": kind,
@@ -239,6 +255,8 @@ def build(args):
               "sha16": c["sha16"],
               "langs": c["langs"],
               "tools": c["tools"],
+              "thinking": bool(args.thinking),
+              "partial_tokens": ntok(partial) if partial else 0,
               "prefix": prefix,
               "target": c["target"],
               "prefix_tokens": ntok(prefix),
@@ -297,12 +315,15 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="analysis/traces")
     ap.add_argument("--n", type=int, default=20)
     ap.add_argument("--n-control", type=int, default=4)
-    ap.add_argument("--n-calib", type=int, default=6)
-    ap.add_argument("--n-calib-control", type=int, default=2)
+    ap.add_argument("--n-calib", type=int, default=0)
+    ap.add_argument("--n-calib-control", type=int, default=0)
     ap.add_argument("--pool", type=int, default=600)
     ap.add_argument("--min-target", type=int, default=384)
     ap.add_argument("--max-target", type=int, default=768)
-    ap.add_argument("--max-prefix", type=int, default=2048)
-    ap.add_argument("--hist-turns", type=int, default=8)
+    ap.add_argument("--max-prefix", type=int, default=24576)
+    ap.add_argument("--hist-turns", type=int, default=24)
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--thinking", action="store_true",
+                    help="leave the think block open (default: closed, so the corpus "
+                         "measures the answer phase, where code is actually emitted)")
     build(ap.parse_args())
